@@ -139,8 +139,8 @@ class Method1BailianAnalyzer:
         
         return prompt_start + citations_text + analysis_requirements
     
-    def call_api(self, prompt: str) -> Dict[str, Any]:
-        """调用百炼API"""
+    def call_api(self, prompt: str, max_retries: int = 3) -> Dict[str, Any]:
+        """调用百炼API，支持重试机制"""
         if not self.api_key:
             return {
                 'success': False,
@@ -169,63 +169,102 @@ class Method1BailianAnalyzer:
             }
         }
         
-        try:
-            prompt_tokens = self.count_chars(prompt)
-            print(f"    调用百炼API... (估算请求Token: {prompt_tokens})")
-            response = requests.post(self.api_ep, headers=headers, json=data, timeout=90)
+        prompt_tokens = self.count_chars(prompt)
+        print(f"    调用百炼API... (估算请求Token: {prompt_tokens})")
+        
+        # 重试循环
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                if attempt > 0:
+                    print(f"    第{attempt + 1}次重试...")
+                
+                # 延长超时时间到180秒
+                response = requests.post(self.api_ep, headers=headers, json=data, timeout=180)
+                
+                # 检查HTTP状态码
+                if response.status_code == 200:
+                    # 成功响应
+                    result = response.json()
+                    print(f"    API调用成功 (第{attempt + 1}次尝试)")
+                    
+                    if result.get('output') and result['output'].get('text'):
+                        content = result['output']['text']
+                        response_tokens = self.count_chars(content)
+                        print(f"    估算响应Token: {response_tokens}")
+                        return {
+                            'success': True,
+                            'error': None,
+                            'content': content
+                        }
+                    else:
+                        print(f"    API返回格式异常: {result}")
+                        last_error = f'API返回格式异常: {result}'
+                        # 格式异常通常不需要重试
+                        break
+                        
+                elif response.status_code == 429:
+                    # 频率限制，需要等待后重试
+                    print(f"    API调用频率超限 (第{attempt + 1}次尝试)，等待30秒后重试")
+                    last_error = 'API调用频率超限'
+                    if attempt < max_retries - 1:  # 不是最后一次尝试
+                        time.sleep(30)
+                        continue
+                    
+                elif response.status_code >= 500:
+                    # 服务器错误，可以重试
+                    print(f"    服务器错误 {response.status_code} (第{attempt + 1}次尝试)，等待10秒后重试")
+                    last_error = f'服务器错误: {response.status_code} - {response.text[:200]}'
+                    if attempt < max_retries - 1:
+                        time.sleep(10)
+                        continue
+                        
+                elif response.status_code in [401, 403]:
+                    # 认证错误，不需要重试
+                    print(f"    认证错误 {response.status_code}，请检查API密钥")
+                    return {
+                        'success': False,
+                        'error': f'认证错误: {response.status_code} - {response.text[:200]}',
+                        'content': None
+                    }
+                    
+                else:
+                    # 其他客户端错误，通常不需要重试
+                    print(f"    客户端错误 {response.status_code}")
+                    last_error = f'客户端错误: {response.status_code} - {response.text[:200]}'
+                    break
             
-            if response.status_code == 429:
-                return {
-                    'success': False,
-                    'error': 'API调用频率超限',
-                    'content': None,
-                    'retry_after': 30
-                }
-            
-            if response.status_code != 200:
-                return {
-                    'success': False,
-                    'error': f'API调用失败: {response.status_code} - {response.text[:200]}',
-                    'content': None
-                }
-            
-            result = response.json()
-            print(f"    API返回: {result}")  # 调试输出
-            
-            if result.get('output') and result['output'].get('text'):
-                content = result['output']['text']
-                response_tokens = self.count_chars(content)
-                print(f"    估算响应Token: {response_tokens}")
-                return {
-                    'success': True,
-                    'error': None,
-                    'content': content
-                }
-            else:
-                return {
-                    'success': False,
-                    'error': f'API返回格式异常: {result}',
-                    'content': None
-                }
-            
-        except requests.exceptions.Timeout:
-            return {
-                'success': False,
-                'error': '网络超时(90秒)',
-                'content': None
-            }
-        except requests.exceptions.ConnectionError:
-            return {
-                'success': False,
-                'error': '网络连接失败',
-                'content': None
-            }
-        except Exception as e:
-            return {
-                'success': False,
-                'error': f'未知错误: {str(e)}',
-                'content': None
-            }
+            except requests.exceptions.Timeout:
+                print(f"    网络超时 (第{attempt + 1}次尝试，180秒)")
+                last_error = '网络超时(180秒)'
+                if attempt < max_retries - 1:
+                    print(f"    等待15秒后进行第{attempt + 2}次尝试")
+                    time.sleep(15)
+                    continue
+                    
+            except requests.exceptions.ConnectionError:
+                print(f"    网络连接失败 (第{attempt + 1}次尝试)")
+                last_error = '网络连接失败'
+                if attempt < max_retries - 1:
+                    print(f"    等待10秒后进行第{attempt + 2}次尝试")
+                    time.sleep(10)
+                    continue
+                    
+            except Exception as e:
+                print(f"    未知错误 (第{attempt + 1}次尝试): {str(e)}")
+                last_error = f'未知错误: {str(e)}'
+                if attempt < max_retries - 1:
+                    print(f"    等待5秒后进行第{attempt + 2}次尝试")
+                    time.sleep(5)
+                    continue
+        
+        # 所有重试都失败了
+        print(f"    API调用最终失败，已重试{max_retries}次")
+        return {
+            'success': False,
+            'error': last_error or 'API调用失败',
+            'content': None
+        }
     
     def analyze_citation_quality(self, row: pd.Series) -> Dict[str, Any]:
         """分析单行数据的引用质量"""
@@ -290,47 +329,49 @@ class Method1BailianAnalyzer:
         return result
     
     def batch_analyze(self, csv_path: str, num_samples: int = 10) -> List[Dict[str, Any]]:
-        """批量分析前N条数据"""
+        """批量分析数据，num_samples=None时处理所有数据"""
         df = self.load_data(csv_path)
         if df is None:
             return []
         
-        # 取前N条数据
-        sample_df = df.head(num_samples)
+        # 确定要处理的数据
+        if num_samples is None:
+            sample_df = df
+            total_count = len(df)
+            print(f"开始分析所有{total_count}条完整问答数据...")
+        else:
+            sample_df = df.head(num_samples)
+            total_count = num_samples
+            print(f"开始分析前{num_samples}条完整问答数据...")
+        
         results = []
         success_count = 0
         failed_count = 0
         
-        print(f"开始分析前{num_samples}条完整问答数据...")
-        print("使用百炼API，测试是否会超限")
+        print("使用百炼API，支持重试机制和超时延长")
         
         for idx, row in sample_df.iterrows():
-            print(f"\n=== 正在分析第{idx + 1}/{num_samples}条 ===")
+            print(f"\n=== 正在分析第{idx + 1}/{total_count}条 (原始索引: {idx}) ===")
             
             result = self.analyze_citation_quality(row)
             
             if result['api_success']:
-                print("    分析成功")
+                print("    ✓ 分析成功")
                 success_count += 1
             else:
-                print(f"    分析失败: {result['api_error']}")
+                print(f"    ✗ 分析失败: {result['api_error']}")
                 failed_count += 1
-                
-                # 如果是频率限制，等待
-                if '频率' in str(result['api_error']) or '429' in str(result['api_error']):
-                    print("    等待30秒...")
-                    time.sleep(30)
             
             results.append({
                 'index': idx + 1,
                 **result
             })
             
-            # 调用间隔
+            # 简化调用间隔，重试机制已经处理了大部分错误情况
             if result['api_success']:
-                time.sleep(5)  # 成功后等5秒
+                time.sleep(3)  # 成功后等3秒（原5秒）
             else:
-                time.sleep(2)   # 失败后等2秒
+                time.sleep(1)   # 失败后等1秒（原2秒），因为重试机制已经等待过了
         
         print(f"\n=== 方案1百炼版分析完成 ===")
         print(f"成功: {success_count}条, 失败: {failed_count}条")
@@ -338,13 +379,27 @@ class Method1BailianAnalyzer:
         return results
     
     def save_results(self, results: List[Dict[str, Any]], output_path: str):
-        """保存分析结果"""
+        """保存分析结果，增强错误处理"""
         try:
+            # 创建目录（如果不存在）
+            import os
+            output_dir = os.path.dirname(output_path)
+            if output_dir and not os.path.exists(output_dir):
+                os.makedirs(output_dir)
+                print(f"创建输出目录：{output_dir}")
+            
+            # 保存结果
             with open(output_path, 'w', encoding='utf-8') as f:
                 json.dump(results, f, ensure_ascii=False, indent=2)
-            print(f"结果已保存到：{output_path}")
+            print(f"✓ 结果已成功保存到：{output_path}")
+            print(f"    文件大小：{os.path.getsize(output_path)} 字节")
+            
+        except PermissionError:
+            print(f"✗ 保存失败：没有写入权限 - {output_path}")
+        except FileNotFoundError:
+            print(f"✗ 保存失败：路径不存在 - {output_path}")
         except Exception as e:
-            print(f"保存结果失败：{e}")
+            print(f"✗ 保存失败：{e}")
 
 def main():
     analyzer = Method1BailianAnalyzer()
@@ -353,7 +408,7 @@ def main():
     csv_path = "local_data/副本正文引文内容（纯净版）.csv"
     output_path = "local_data/citation_analysis_method1_bailian_results.json"
 
-    results = analyzer.batch_analyze(csv_path, num_samples=10)
+    results = analyzer.batch_analyze(csv_path, num_samples=None)  # None表示处理所有数据
     
     if results:
         analyzer.save_results(results, output_path)
