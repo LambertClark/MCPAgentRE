@@ -7,17 +7,21 @@
 import pandas as pd
 import json
 import requests
+import aiohttp
+import asyncio
 import os
 import re
 from typing import Dict, List, Any
 import time
 
 class Method1BailianAnalyzer:
-    def __init__(self):
+    def __init__(self, concurrent_limit: int = 50):
         self.api_key = os.getenv('AL_KEY')
         self.api_ep = 'https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation'
         self.model = 'qwen-plus-latest'  # 百炼的模型名
+        self.concurrent_limit = concurrent_limit
         print(f"正在使用模型: {self.model}")
+        print(f"并发限制: {self.concurrent_limit}条")
         
         if not self.api_key:
             print("警告：未找到AL_KEY环境变量，无法调用百炼API")
@@ -138,6 +142,119 @@ class Method1BailianAnalyzer:
 '''
         
         return prompt_start + citations_text + analysis_requirements
+    
+    async def call_api_async(self, session: aiohttp.ClientSession, prompt: str, max_retries: int = 3) -> Dict[str, Any]:
+        """异步调用百炼API，支持重试机制"""
+        if not self.api_key:
+            return {
+                'success': False,
+                'error': '缺少AL_KEY环境变量',
+                'content': None
+            }
+        
+        headers = {
+            'Content-Type': 'application/json',
+            'Authorization': f'Bearer {self.api_key}'
+        }
+        
+        data = {
+            'model': self.model,
+            'input': {
+                'messages': [
+                    {
+                        'role': 'user',
+                        'content': prompt
+                    }
+                ]
+            },
+            'parameters': {
+                'temperature': 0.2,
+                'max_tokens': 15000
+            }
+        }
+        
+        prompt_tokens = self.count_chars(prompt)
+        
+        # 重试循环
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                # 延长超时时间到180秒
+                timeout = aiohttp.ClientTimeout(total=180)
+                
+                async with session.post(self.api_ep, headers=headers, json=data, timeout=timeout) as response:
+                    # 检查HTTP状态码
+                    if response.status == 200:
+                        # 成功响应
+                        result = await response.json()
+                        
+                        if result.get('output') and result['output'].get('text'):
+                            content = result['output']['text']
+                            response_tokens = self.count_chars(content)
+                            return {
+                                'success': True,
+                                'error': None,
+                                'content': content
+                            }
+                        else:
+                            last_error = f'API返回格式异常: {result}'
+                            # 格式异常通常不需要重试
+                            break
+                            
+                    elif response.status == 429:
+                        # 频率限制，需要等待后重试
+                        last_error = 'API调用频率超限'
+                        if attempt < max_retries - 1:  # 不是最后一次尝试
+                            await asyncio.sleep(30)
+                            continue
+                        
+                    elif response.status >= 500:
+                        # 服务器错误，可以重试
+                        response_text = await response.text()
+                        last_error = f'服务器错误: {response.status} - {response_text[:200]}' 
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(10)
+                            continue
+                            
+                    elif response.status in [401, 403]:
+                        # 认证错误，不需要重试
+                        response_text = await response.text()
+                        return {
+                            'success': False,
+                            'error': f'认证错误: {response.status} - {response_text[:200]}',
+                            'content': None
+                        }
+                        
+                    else:
+                        # 其他客户端错误，通常不需要重试
+                        response_text = await response.text()
+                        last_error = f'客户端错误: {response.status} - {response_text[:200]}'
+                        break
+            
+            except asyncio.TimeoutError:
+                last_error = '网络超时(180秒)'
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(15)
+                    continue
+                    
+            except aiohttp.ClientConnectionError:
+                last_error = '网络连接失败'
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(10)
+                    continue
+                    
+            except Exception as e:
+                last_error = f'未知错误: {str(e)}'
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(5)
+                    continue
+        
+        # 所有重试都失败了
+        return {
+            'success': False,
+            'error': last_error or 'API调用失败',
+            'content': None
+        }
     
     def call_api(self, prompt: str, max_retries: int = 3) -> Dict[str, Any]:
         """调用百炼API，支持重试机制"""
@@ -328,6 +445,133 @@ class Method1BailianAnalyzer:
         
         return result
     
+    async def analyze_citation_quality_async(self, session: aiohttp.ClientSession, row: pd.Series, index: int) -> Dict[str, Any]:
+        """异步分析单行数据的引用质量"""
+        question = str(row['模型prompt'])
+        answer = str(row['答案'])
+        
+        # 构建引文字典
+        citations_dict = {}
+        for i in range(1, 21):
+            col_name = f'引文{i}'
+            if col_name in row and pd.notna(row[col_name]):
+                citations_dict[i] = str(row[col_name])
+        
+        # 提取使用的引用
+        citations_used = self.extract_citations(answer)
+        
+        # 如果没有任何引用，跳过分析
+        if not citations_used:
+            return {
+                'index': index,
+                'question': question,
+                'answer_preview': answer[:200] + '...' if len(answer) > 200 else answer,
+                'citations_used': citations_used,
+                'citations_available': list(citations_dict.keys()),
+                'api_success': True,  # 标记为成功但跳过
+                'api_error': None,
+                'analysis': '跳过分析：答案中没有引用标记',
+                'skipped': True
+            }
+        
+        # 生成分析prompt
+        analysis_prompt = self.prepare_analysis_prompt(question, answer, citations_dict)
+        
+        # 调用异步API分析
+        api_result = await self.call_api_async(session, analysis_prompt)
+        
+        analysis_content = None
+        if api_result['success']:
+            try:
+                # 尝试解析API返回的JSON字符串
+                analysis_content = json.loads(api_result['content'])
+            except json.JSONDecodeError:
+                # 如果解析失败，说明返回的不是合法的JSON，作为原始文本处理
+                analysis_content = api_result['content']
+
+        result = {
+            'index': index,
+            'question': question,
+            'answer_preview': answer[:200] + '...' if len(answer) > 200 else answer,
+            'citations_used': citations_used,
+            'citations_available': list(citations_dict.keys()),
+            'api_success': api_result['success'],
+            'api_error': api_result['error'],
+            'analysis': analysis_content,
+            'skipped': False
+        }
+        
+        return result
+    
+    async def batch_analyze_concurrent(self, csv_path: str, num_samples: int = None) -> List[Dict[str, Any]]:
+        """异步并发批量分析"""
+        df = self.load_data(csv_path)
+        if df is None:
+            return []
+        
+        # 确定要处理的数据
+        if num_samples is None:
+            sample_df = df
+            total_count = len(df)
+            print(f"开始并发分析所有{total_count}条完整问答数据...")
+        else:
+            sample_df = df.head(num_samples)
+            total_count = num_samples
+            print(f"开始并发分析前{num_samples}条完整问答数据...")
+        
+        print(f"使用百炼API，并发限制: {self.concurrent_limit}条")
+        
+        # 创建信号量来控制并发数量
+        semaphore = asyncio.Semaphore(self.concurrent_limit)
+        
+        async def process_with_semaphore(session, row, index):
+            async with semaphore:
+                result = await self.analyze_citation_quality_async(session, row, index + 1)
+                return result
+        
+        # 创建HTTP会话
+        connector = aiohttp.TCPConnector(limit=100)  # 连接池大小
+        async with aiohttp.ClientSession(connector=connector) as session:
+            # 创建任务列表
+            tasks = []
+            for idx, row in sample_df.iterrows():
+                task = process_with_semaphore(session, row, idx)
+                tasks.append(task)
+            
+            # 执行所有任务并显示进度
+            print(f"开始处理{len(tasks)}个任务...")
+            start_time = time.time()
+            
+            completed_tasks = []
+            for task in asyncio.as_completed(tasks):
+                result = await task
+                completed_tasks.append(result)
+                
+                # 显示进度
+                progress = len(completed_tasks)
+                elapsed = time.time() - start_time
+                avg_time = elapsed / progress if progress > 0 else 0
+                eta = avg_time * (total_count - progress)
+                
+                status = "✓" if result['api_success'] else "✗"
+                print(f"[{progress}/{total_count}] {status} 第{result['index']}条 "
+                      f"(用时: {elapsed:.1f}s, ETA: {eta:.1f}s)")
+        
+        # 按index排序结果
+        completed_tasks.sort(key=lambda x: x['index'])
+        
+        # 统计结果
+        success_count = sum(1 for r in completed_tasks if r['api_success'])
+        failed_count = len(completed_tasks) - success_count
+        
+        total_time = time.time() - start_time
+        print(f"\n=== 并发分析完成 ===")
+        print(f"总用时: {total_time:.1f}秒")
+        print(f"平均每条: {total_time/len(completed_tasks):.2f}秒")
+        print(f"成功: {success_count}条, 失败: {failed_count}条")
+        
+        return completed_tasks
+    
     def batch_analyze(self, csv_path: str, num_samples: int = 10) -> List[Dict[str, Any]]:
         """批量分析数据，num_samples=None时处理所有数据"""
         df = self.load_data(csv_path)
@@ -401,7 +645,36 @@ class Method1BailianAnalyzer:
         except Exception as e:
             print(f"✗ 保存失败：{e}")
 
+async def main_async():
+    """异步并发版本的主函数"""
+    analyzer = Method1BailianAnalyzer(concurrent_limit=50)  # 50并发
+    
+    # 数据路径
+    csv_path = "local_data/副本正文引文内容（纯净版）.csv"
+    output_path = "local_data/citation_analysis_method1_bailian_concurrent_results.json"
+
+    print("🚀 启动高速并发分析模式！")
+    results = await analyzer.batch_analyze_concurrent(csv_path, num_samples=None)
+    
+    if results:
+        analyzer.save_results(results, output_path)
+        print(f"\n🎉 并发分析完成！")
+        
+        # 显示成功的结果预览
+        success_results = [r for r in results if r['api_success']]
+        if success_results:
+            print(f"\n成功分析示例：")
+            for i, result in enumerate(success_results[:1]):
+                print(f"\n{i+1}. 第{result['index']}条数据:")
+                print(f"   使用引用: {result['citations_used']}")
+                print(f"   可用引文: {len(result['citations_available'])}个")
+                if result['analysis']:
+                    print(f"   分析片段: {result['analysis'][:150]}...")
+    else:
+        print("分析失败，请检查数据文件和AL_KEY配置")
+
 def main():
+    """同步版本主函数（兼容性保留）"""
     analyzer = Method1BailianAnalyzer()
     
     # 数据路径
@@ -428,4 +701,5 @@ def main():
         print("分析失败，请检查数据文件和AL_KEY配置")
 
 if __name__ == "__main__":
-    main()
+    # 运行并发版本
+    asyncio.run(main_async())
