@@ -59,13 +59,10 @@ class Method1BailianAnalyzer:
         
         prompt_start = f"""请分析以下问答内容中引用与引文的匹配关系：
 
-【问题】
-{question}
-
-【回答内容】
+【完整答案内容（包含思考过程和回答内容）】
 {answer}
 
-【回答中使用的引用标记】
+【答案中使用的引用标记】
 {used_citations}
 
 【可用引文内容】
@@ -81,20 +78,26 @@ class Method1BailianAnalyzer:
                 citations_text += f"引文{citation_num}：（未找到对应内容）\n\n"
         
         analysis_requirements = '''【分析要求】
-你是一个严谨的文本分析专家。你的核心任务是：只分析包含引用标记[citation:x]的句子，完全跳过没有引用标记的句子。
+你是一个严谨的文本分析专家。
+
+🚨 核心规则：只输出包含[citation:x]标记的句子！没有引用标记的句子绝对不能出现在JSON输出中！
+
+你的任务：分析完整答案内容（包含思考过程和回答内容）中所有包含引用标记[citation:x]的句子，完全跳过没有引用标记的句子。
 
 **重要规则（必须严格遵守）**：
-- 如果一个句子没有[citation:x]标记，立即跳过，不要在JSON输出中包含该句子
-- 只分析和输出包含明确引用标记的句子
-- 绝对不要分析没有引用标记的句子
+- **引用边界识别**：引用标记[citation:x]的作用范围严格以句号（。）、换行符、段落分隔符为边界，绝对不能跨越这些边界
+- **逐句独立分析**：必须将文本按句号（。）拆分为独立句子，每个句子单独判断是否包含引用标记
+- **无引用标记=跳过**：如果一个句子内部没有[citation:x]标记，无论其前后句子是否有引用，都必须完全跳过该句子
+- **严禁跨句关联**：绝对不能将前一句子的引用标记应用到后续没有引用标记的句子上
 
 请遵循以下步骤和规则：
 
-1.  **逐句拆分**：将【回答内容】拆分为独立的观点或句子。
+1.  **逐句拆分**：将【完整答案内容】拆分为独立的观点或句子，在思考过程和回答内容两部分中都要查找。
 2.  **逐句分析**：对于每一个独立的观点或句子：
     a. **首先检查**：该句子是否包含引用标记 `[citation:x]`。如果没有任何引用标记，立即跳过该句子，不进行分析。
-    b. 如果有引用标记，在对应的 `引文x` 中查找支持性证据。
-    c. **严格判断**：
+    b. **精确划定引用范围**：引用标记仅对引用标记列中位置**之前**的内容起作用。标点号后或新句子开始后的内容不在引用范围内。
+    c. 如果有引用标记，在对应的 `引文x` 中查找支持性证据。
+    d. **严格判断**：
         - **完全一致 (Consistent)**：当且仅当句子中的**所有信息点**（包括核心事实、数据、限定词、描述性词语）都能在引文中找到**明确、直接**的表述时，才能判定为“一致”。
         - **不一致 (Inconsistent)**：如果句子中包含任何引文中**没有明确提及**的信息（例如，具体的数字、夸大的描述、不同的概念），或者与引文内容相悖，则判定为“不一致”。这被视为一种“模型幻觉”。
 3.  **输出格式**：
@@ -108,10 +111,18 @@ class Method1BailianAnalyzer:
         "consistency": "一致" 或 "不一致",
         "reason": "详细的判断理由。如果一致，请说明证据在哪。如果不一致，请明确指出是哪个信息点在引文中无法找到或存在矛盾。"
       }
-4. **空引用情况（重要）**：
-    - 对于没有任何引用标记[citation:x]的句子，请完全跳过，不要在JSON输出中包含该句子。
-    - 只分析包含明确引用标记的句子。
-    - 错误示范（绝对不要这样做）：
+4. **空引用情况（绝对重要）**：
+    - **完全跳过规则**：如果一个句子没有[citation:x]标记，绝对不能出现在JSON输出中，连提及都不行
+    - **错误做法1**（绝对禁止）：
+      ```json
+      {
+        "topic": "火焰山的最佳游览时间是清晨7:00-9:00...",
+        "citation_numbers": [],
+        "consistency": "一致",
+        "reason": "该句无引用标记，根据规则应跳过..."
+      }
+      ```
+    - **错误做法2**（绝对禁止）：
       ```json
       {
         "topic": "优化操作设置是提升游戏体验的关键。",
@@ -120,25 +131,30 @@ class Method1BailianAnalyzer:
         "reason": "该句无引用标记..."
       }
       ```
-    - 正确做法：完全跳过没有引用标记的句子，不在输出中包含。
+    - **正确做法**：这些句子在输出JSON中完全不存在，就像它们从未出现过一样
+
+**关键示例（引用边界识别）**：
+错误的文本："根据[citation:6][citation:7][citation:8]，吐鲁番的最佳旅游时间是4-5月和9-10月，气温适宜。火焰山的最佳游览时间是清晨7:00-9:00或傍晚18:00-20:00，避开正午高温。"
+
+**正确分析方法**：
+1. 第一句："根据[citation:6][citation:7][citation:8]，吐鲁番的最佳旅游时间是4-5月和9-10月，气温适宜。" → **包含引用标记，需要分析**
+2. 第二句："火焰山的最佳游览时间是清晨7:00-9:00或傍晚18:00-20:00，避开正午高温。" → **没有引用标记，必须跳过**
+
+**错误做法**（绝对禁止）：将第二句也关联到[citation:6][citation:7][citation:8]，这是错误的跨句关联。
 
 **示例输出**：
       ```json
       [
         {
-          "topic": "干细胞治疗成本高昂，单次治疗费用达20万–100万元。",
-          "citation_numbers": [8],
-          "consistency": "不一致",
-          "reason": "引文8仅提及'生产此类细胞成本高昂'，但并未提供'20万–100万元'这一具体费用范围，该数字属于模型幻觉。"
-        },
-        {
-          "topic": "干细胞具有修复、再生、调节三大核心功能。",
-          "citation_numbers": [5],
-          "consistency": "不一致",
-          "reason": "引文5明确指出三大功能是'修复功能、调节代谢功能、自我更新功能'，并未提及'再生功能'，概念不完全匹配。"
+          "topic": "根据[citation:6][citation:7][citation:8]，吐鲁番的最佳旅游时间是4-5月和9-10月，气温适宜",
+          "citation_numbers": [6, 7, 8],
+          "consistency": "一致",
+          "reason": "引文6、7、8均支持该时间段和气温描述"
         }
       ]
       ```
+
+注意：上例中"火焰山..."句子完全不出现在输出中，因为它没有引用标记。
 '''
         
         return prompt_start + citations_text + analysis_requirements
@@ -445,7 +461,7 @@ class Method1BailianAnalyzer:
         
         return result
     
-    async def analyze_citation_quality_async(self, session: aiohttp.ClientSession, row: pd.Series, index: int) -> Dict[str, Any]:
+    async def analyze_citation_quality_async(self, session: aiohttp.ClientSession, row: pd.Series, rank: int) -> Dict[str, Any]:
         """异步分析单行数据的引用质量"""
         question = str(row['模型prompt'])
         answer = str(row['答案'])
@@ -463,7 +479,7 @@ class Method1BailianAnalyzer:
         # 如果没有任何引用，跳过分析
         if not citations_used:
             return {
-                'index': index,
+                'rank': rank,
                 'question': question,
                 'answer_preview': answer[:200] + '...' if len(answer) > 200 else answer,
                 'citations_used': citations_used,
@@ -490,7 +506,7 @@ class Method1BailianAnalyzer:
                 analysis_content = api_result['content']
 
         result = {
-            'index': index,
+            'rank': rank,
             'question': question,
             'answer_preview': answer[:200] + '...' if len(answer) > 200 else answer,
             'citations_used': citations_used,
@@ -503,18 +519,45 @@ class Method1BailianAnalyzer:
         
         return result
     
-    async def batch_analyze_concurrent(self, csv_path: str, num_samples: int = None) -> List[Dict[str, Any]]:
+    async def batch_analyze_concurrent(self, csv_path: str, num_samples: int = None, specific_rank: int = None, start_from: int = None) -> List[Dict[str, Any]]:
         """异步并发批量分析"""
         df = self.load_data(csv_path)
         if df is None:
             return []
         
         # 确定要处理的数据
-        if num_samples is None:
+        if specific_rank is not None:
+            # 处理特定rank的单条数据
+            if specific_rank <= 0 or specific_rank > len(df):
+                print(f"错误：指定的rank {specific_rank} 超出数据范围 (1-{len(df)})")
+                return []
+            sample_df = df.iloc[[specific_rank - 1]]  # rank是1-based，转为0-based索引
+            total_count = 1
+            print(f"开始分析第{specific_rank}条数据...")
+        elif start_from is not None:
+            # 从指定位置开始处理指定数量的数据
+            if start_from <= 0 or start_from > len(df):
+                print(f"错误：起始位置 {start_from} 超出数据范围 (1-{len(df)})")
+                return []
+            start_idx = start_from - 1  # start_from是1-based，转为0-based索引
+            if num_samples is None:
+                # 从起始位置到结尾
+                sample_df = df.iloc[start_idx:]
+                total_count = len(df) - start_idx
+                print(f"开始分析从第{start_from}条开始的所有数据（共{total_count}条）...")
+            else:
+                # 从起始位置开始指定数量
+                end_idx = min(start_idx + num_samples, len(df))
+                sample_df = df.iloc[start_idx:end_idx]
+                total_count = len(sample_df)
+                print(f"开始分析从第{start_from}条开始的{total_count}条数据...")
+        elif num_samples is None:
+            # 处理所有数据
             sample_df = df
             total_count = len(df)
             print(f"开始并发分析所有{total_count}条完整问答数据...")
         else:
+            # 处理前num_samples条数据
             sample_df = df.head(num_samples)
             total_count = num_samples
             print(f"开始并发分析前{num_samples}条完整问答数据...")
@@ -524,9 +567,9 @@ class Method1BailianAnalyzer:
         # 创建信号量来控制并发数量
         semaphore = asyncio.Semaphore(self.concurrent_limit)
         
-        async def process_with_semaphore(session, row, index):
+        async def process_with_semaphore(session, row, rank):
             async with semaphore:
-                result = await self.analyze_citation_quality_async(session, row, index + 1)
+                result = await self.analyze_citation_quality_async(session, row, rank + 1)
                 return result
         
         # 创建HTTP会话
@@ -554,11 +597,11 @@ class Method1BailianAnalyzer:
                 eta = avg_time * (total_count - progress)
                 
                 status = "✓" if result['api_success'] else "✗"
-                print(f"[{progress}/{total_count}] {status} 第{result['index']}条 "
+                print(f"[{progress}/{total_count}] {status} 第{result['rank']}条 "
                       f"(用时: {elapsed:.1f}s, ETA: {eta:.1f}s)")
         
-        # 按index排序结果
-        completed_tasks.sort(key=lambda x: x['index'])
+        # 按rank排序结果
+        completed_tasks.sort(key=lambda x: x['rank'])
         
         # 统计结果
         success_count = sum(1 for r in completed_tasks if r['api_success'])
@@ -572,18 +615,45 @@ class Method1BailianAnalyzer:
         
         return completed_tasks
     
-    def batch_analyze(self, csv_path: str, num_samples: int = 10) -> List[Dict[str, Any]]:
+    def batch_analyze(self, csv_path: str, num_samples: int = 10, specific_rank: int = None, start_from: int = None) -> List[Dict[str, Any]]:
         """批量分析数据，num_samples=None时处理所有数据"""
         df = self.load_data(csv_path)
         if df is None:
             return []
         
         # 确定要处理的数据
-        if num_samples is None:
+        if specific_rank is not None:
+            # 处理特定rank的单条数据
+            if specific_rank <= 0 or specific_rank > len(df):
+                print(f"错误：指定的rank {specific_rank} 超出数据范围 (1-{len(df)})")
+                return []
+            sample_df = df.iloc[[specific_rank - 1]]  # rank是1-based，转为0-based索引
+            total_count = 1
+            print(f"开始分析第{specific_rank}条数据...")
+        elif start_from is not None:
+            # 从指定位置开始处理指定数量的数据
+            if start_from <= 0 or start_from > len(df):
+                print(f"错误：起始位置 {start_from} 超出数据范围 (1-{len(df)})")
+                return []
+            start_idx = start_from - 1  # start_from是1-based，转为0-based索引
+            if num_samples is None:
+                # 从起始位置到结尾
+                sample_df = df.iloc[start_idx:]
+                total_count = len(df) - start_idx
+                print(f"开始分析从第{start_from}条开始的所有数据（共{total_count}条）...")
+            else:
+                # 从起始位置开始指定数量
+                end_idx = min(start_idx + num_samples, len(df))
+                sample_df = df.iloc[start_idx:end_idx]
+                total_count = len(sample_df)
+                print(f"开始分析从第{start_from}条开始的{total_count}条数据...")
+        elif num_samples is None:
+            # 处理所有数据
             sample_df = df
             total_count = len(df)
             print(f"开始分析所有{total_count}条完整问答数据...")
         else:
+            # 处理前num_samples条数据
             sample_df = df.head(num_samples)
             total_count = num_samples
             print(f"开始分析前{num_samples}条完整问答数据...")
@@ -595,7 +665,9 @@ class Method1BailianAnalyzer:
         print("使用百炼API，支持重试机制和超时延长")
         
         for idx, row in sample_df.iterrows():
-            print(f"\n=== 正在分析第{idx + 1}/{total_count}条 (原始索引: {idx}) ===")
+            # 使用原始索引+1作为rank
+            actual_rank = idx + 1
+            print(f"\n=== 正在分析第{actual_rank}条数据 (DataFrame索引: {idx}) ===")
             
             result = self.analyze_citation_quality(row)
             
@@ -607,7 +679,7 @@ class Method1BailianAnalyzer:
                 failed_count += 1
             
             results.append({
-                'index': idx + 1,
+                'rank': actual_rank,
                 **result
             })
             
@@ -645,16 +717,143 @@ class Method1BailianAnalyzer:
         except Exception as e:
             print(f"✗ 保存失败：{e}")
 
-async def main_async():
-    """异步并发版本的主函数"""
+def get_user_choice() -> dict:
+    """获取用户选择的运行模式"""
+    print("\n=== 引文分析脚本 ===")
+    print("请选择运行模式：")
+    print("1. 分析特定rank的单条数据（同步模式）")
+    print("2. 从指定位置开始分析指定数量的数据（同步模式）") 
+    print("3. 分析所有数据（并发模式）")
+    print("4. 分析前N条数据（并发模式）")
+    print("5. 分析特定rank的单条数据（并发模式）")
+    print("6. 退出")
+    
+    while True:
+        try:
+            choice = input("\n请输入选择 (1-6): ").strip()
+            
+            if choice == '1':
+                rank = int(input("请输入要分析的rank (从1开始): "))
+                return {"mode": "specific_rank", "specific_rank": rank}
+                
+            elif choice == '2':
+                start_from = int(input("请输入起始位置 (从1开始): "))
+                count_input = input("请输入要分析的数量 (留空表示分析到结尾): ").strip()
+                num_samples = int(count_input) if count_input else None
+                return {"mode": "start_from", "start_from": start_from, "num_samples": num_samples}
+                
+            elif choice == '3':
+                return {"mode": "all", "num_samples": None}
+                
+            elif choice == '4':
+                num_samples = int(input("请输入要分析的数据量: "))
+                return {"mode": "head", "num_samples": num_samples}
+                
+            elif choice == '5':
+                rank = int(input("请输入要分析的rank (从1开始): "))
+                return {"mode": "specific_rank_async", "specific_rank": rank}
+                
+            elif choice == '6':
+                print("退出程序")
+                return {"mode": "exit"}
+                
+            else:
+                print("无效选择，请重新输入")
+                
+        except ValueError:
+            print("输入格式错误，请输入数字")
+        except KeyboardInterrupt:
+            print("\n用户取消操作")
+            return {"mode": "exit"}
+
+def main_unified():
+    """统一主函数，根据用户选择决定同步或异步"""
+    # 获取用户选择
+    user_choice = get_user_choice()
+    if user_choice["mode"] == "exit":
+        return
+        
+    # 根据模式决定使用同步还是异步
+    if user_choice["mode"] in ["specific_rank", "start_from"]:
+        # 同步模式
+        main_sync(user_choice)
+    else:
+        # 异步模式
+        asyncio.run(main_async_impl(user_choice))
+
+def main_sync(user_choice):
+    """同步版本主函数"""
+    analyzer = Method1BailianAnalyzer()
+    
+    # 数据路径
+    csv_path = "local_data/副本正文引文内容（纯净版）.csv"
+    
+    # 根据用户选择设置输出文件名
+    if user_choice["mode"] == "specific_rank":
+        output_path = f"local_data/citation_analysis_rank_{user_choice['specific_rank']}_sync_results.json"
+    elif user_choice["mode"] == "start_from":
+        if user_choice.get("num_samples"):
+            output_path = f"local_data/citation_analysis_from_{user_choice['start_from']}_count_{user_choice['num_samples']}_sync_results.json"
+        else:
+            output_path = f"local_data/citation_analysis_from_{user_choice['start_from']}_to_end_sync_results.json"
+    else:
+        output_path = "local_data/citation_analysis_sync_results.json"
+
+    print(f"开始同步分析...")
+    print(f"输出文件：{output_path}")
+    
+    # 根据用户选择调用不同的分析方法
+    if user_choice["mode"] == "specific_rank":
+        results = analyzer.batch_analyze(csv_path, specific_rank=user_choice["specific_rank"])
+    elif user_choice["mode"] == "start_from":
+        results = analyzer.batch_analyze(csv_path, 
+                                       num_samples=user_choice.get("num_samples"),
+                                       start_from=user_choice["start_from"])
+    else:
+        results = analyzer.batch_analyze(csv_path)
+    
+    if results:
+        analyzer.save_results(results, output_path)
+        print(f"\n方案1百炼版分析完成！")
+        
+        # 显示成功的结果预览
+        success_results = [r for r in results if r['api_success']]
+        if success_results:
+            print(f"\n成功分析示例：")
+            for i, result in enumerate(success_results[:1]):
+                print(f"\n{i+1}. 第{result['rank']}条数据:")
+                print(f"   使用引用: {result['citations_used']}")
+                print(f"   可用引文: {len(result['citations_available'])}个")
+                if result['analysis']:
+                    print(f"   分析片段: {result['analysis'][:150]}...")
+    else:
+        print("分析失败，请检查数据文件和AL_KEY配置")
+
+async def main_async_impl(user_choice):
+    """异步并发版本的主函数实现"""
     analyzer = Method1BailianAnalyzer(concurrent_limit=50)  # 50并发
     
     # 数据路径
     csv_path = "local_data/副本正文引文内容（纯净版）.csv"
-    output_path = "local_data/citation_analysis_method1_bailian_concurrent_results.json"
+    
+    # 根据用户选择设置输出文件名
+    if user_choice["mode"] == "specific_rank_async":
+        output_path = f"local_data/citation_analysis_rank_{user_choice['specific_rank']}_async_results.json"
+    elif user_choice["mode"] == "head":
+        output_path = f"local_data/citation_analysis_head_{user_choice['num_samples']}_results.json"
+    else:
+        output_path = "local_data/citation_analysis_method1_bailian_concurrent_results.json"
 
-    print("🚀 启动高速并发分析模式！")
-    results = await analyzer.batch_analyze_concurrent(csv_path, num_samples=None)
+    print(f"🚀 启动高速并发分析模式！")
+    print(f"输出文件：{output_path}")
+    
+    # 根据用户选择调用不同的分析方法
+    if user_choice["mode"] == "specific_rank_async":
+        results = await analyzer.batch_analyze_concurrent(csv_path, specific_rank=user_choice["specific_rank"])
+    elif user_choice["mode"] == "head":
+        results = await analyzer.batch_analyze_concurrent(csv_path, num_samples=user_choice["num_samples"])
+    else:  # "all"
+        results = await analyzer.batch_analyze_concurrent(csv_path, num_samples=None)
     
     if results:
         analyzer.save_results(results, output_path)
@@ -665,7 +864,7 @@ async def main_async():
         if success_results:
             print(f"\n成功分析示例：")
             for i, result in enumerate(success_results[:1]):
-                print(f"\n{i+1}. 第{result['index']}条数据:")
+                print(f"\n{i+1}. 第{result['rank']}条数据:")
                 print(f"   使用引用: {result['citations_used']}")
                 print(f"   可用引文: {len(result['citations_available'])}个")
                 if result['analysis']:
@@ -673,26 +872,60 @@ async def main_async():
     else:
         print("分析失败，请检查数据文件和AL_KEY配置")
 
+# 保留原来的函数名作为别名        
+async def main_async():
+    """异步并发版本的主函数（兼容性保留）"""
+    user_choice = {"mode": "all"}
+    await main_async_impl(user_choice)
+
 def main():
-    """同步版本主函数（兼容性保留）"""
+    """交互式主函数"""
+    # 获取用户选择
+    user_choice = get_user_choice()
+    if user_choice["mode"] == "exit":
+        return
+        
     analyzer = Method1BailianAnalyzer()
     
     # 数据路径
     csv_path = "local_data/副本正文引文内容（纯净版）.csv"
-    output_path = "local_data/citation_analysis_method1_bailian_results.json"
+    
+    # 根据用户选择设置输出文件名
+    if user_choice["mode"] == "specific_rank":
+        output_path = f"local_data/citation_analysis_rank_{user_choice['specific_rank']}_sync_results.json"
+    elif user_choice["mode"] == "start_from":
+        if user_choice.get("num_samples"):
+            output_path = f"local_data/citation_analysis_from_{user_choice['start_from']}_count_{user_choice['num_samples']}_sync_results.json"
+        else:
+            output_path = f"local_data/citation_analysis_from_{user_choice['start_from']}_to_end_sync_results.json"
+    elif user_choice["mode"] == "head":
+        output_path = f"local_data/citation_analysis_head_{user_choice['num_samples']}_sync_results.json"
+    else:
+        output_path = "local_data/citation_analysis_method1_bailian_sync_results.json"
 
-    results = analyzer.batch_analyze(csv_path, num_samples=None)  # None表示处理所有数据
+    print(f"开始同步分析...")
+    print(f"输出文件：{output_path}")
+    
+    # 根据用户选择调用不同的分析方法
+    if user_choice["mode"] == "specific_rank":
+        results = analyzer.batch_analyze(csv_path, specific_rank=user_choice["specific_rank"])
+    elif user_choice["mode"] == "start_from":
+        results = analyzer.batch_analyze(csv_path, 
+                                       num_samples=user_choice.get("num_samples"),
+                                       start_from=user_choice["start_from"])
+    else:  # "all" or "head"
+        results = analyzer.batch_analyze(csv_path, num_samples=user_choice.get("num_samples"))
     
     if results:
         analyzer.save_results(results, output_path)
-        print(f"\n方案1百炼版测试完成！")
+        print(f"\n方案1百炼版分析完成！")
         
         # 显示成功的结果预览
         success_results = [r for r in results if r['api_success']]
         if success_results:
             print(f"\n成功分析示例：")
             for i, result in enumerate(success_results[:1]):
-                print(f"\n{i+1}. 第{result['index']}条数据:")
+                print(f"\n{i+1}. 第{result['rank']}条数据:")
                 print(f"   使用引用: {result['citations_used']}")
                 print(f"   可用引文: {len(result['citations_available'])}个")
                 if result['analysis']:
@@ -701,5 +934,5 @@ def main():
         print("分析失败，请检查数据文件和AL_KEY配置")
 
 if __name__ == "__main__":
-    # 运行并发版本
-    asyncio.run(main_async())
+    # 运行统一主函数，根据用户选择自动决定同步或异步
+    main_unified()
