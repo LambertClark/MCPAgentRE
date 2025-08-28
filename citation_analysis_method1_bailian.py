@@ -18,10 +18,8 @@ class Method1BailianAnalyzer:
     def __init__(self, concurrent_limit: int = 50):
         self.api_key = os.getenv('AL_KEY')
         self.api_ep = 'https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation'
-        self.model = 'qwen-plus-latest'  # 百炼的模型名
+        self.model = 'qwen-plus'
         self.concurrent_limit = concurrent_limit
-        print(f"正在使用模型: {self.model}")
-        print(f"并发限制: {self.concurrent_limit}条")
         
         if not self.api_key:
             print("警告：未找到AL_KEY环境变量，无法调用百炼API")
@@ -176,12 +174,10 @@ class Method1BailianAnalyzer:
         data = {
             'model': self.model,
             'input': {
-                'messages': [
-                    {
-                        'role': 'user',
-                        'content': prompt
-                    }
-                ]
+                'messages': [{
+                    'role': 'user',
+                    'content': prompt
+                }]
             },
             'parameters': {
                 'temperature': 0.2,
@@ -302,104 +298,64 @@ class Method1BailianAnalyzer:
             }
         }
         
-        prompt_tokens = self.count_chars(prompt)
-        print(f"    调用百炼API... (估算请求Token: {prompt_tokens})")
-        
         # 重试循环
-        last_error = None
         for attempt in range(max_retries):
             try:
-                if attempt > 0:
-                    print(f"    第{attempt + 1}次重试...")
-                
-                # 延长超时时间到180秒
+                print(f"    API调用尝试 {attempt + 1}/{max_retries}...")
                 response = requests.post(self.api_ep, headers=headers, json=data, timeout=180)
                 
-                # 检查HTTP状态码
                 if response.status_code == 200:
-                    # 成功响应
                     result = response.json()
-                    print(f"    API调用成功 (第{attempt + 1}次尝试)")
-                    
                     if result.get('output') and result['output'].get('text'):
-                        content = result['output']['text']
-                        response_tokens = self.count_chars(content)
-                        print(f"    估算响应Token: {response_tokens}")
+                        print(f"    ✓ API调用成功")
                         return {
                             'success': True,
                             'error': None,
-                            'content': content
+                            'content': result['output']['text']
                         }
                     else:
-                        print(f"    API返回格式异常: {result}")
-                        last_error = f'API返回格式异常: {result}'
-                        # 格式异常通常不需要重试
-                        break
+                        return {'success': False, 'error': f'API返回格式异常: {result}', 'content': None}
                         
-                elif response.status_code == 429:
-                    # 频率限制，需要等待后重试
-                    print(f"    API调用频率超限 (第{attempt + 1}次尝试)，等待30秒后重试")
-                    last_error = 'API调用频率超限'
-                    if attempt < max_retries - 1:  # 不是最后一次尝试
-                        time.sleep(30)
-                        continue
-                    
-                elif response.status_code >= 500:
-                    # 服务器错误，可以重试
-                    print(f"    服务器错误 {response.status_code} (第{attempt + 1}次尝试)，等待10秒后重试")
-                    last_error = f'服务器错误: {response.status_code} - {response.text[:200]}'
-                    if attempt < max_retries - 1:
-                        time.sleep(10)
-                        continue
-                        
-                elif response.status_code in [401, 403]:
-                    # 认证错误，不需要重试
-                    print(f"    认证错误 {response.status_code}，请检查API密钥")
-                    return {
-                        'success': False,
-                        'error': f'认证错误: {response.status_code} - {response.text[:200]}',
-                        'content': None
-                    }
-                    
-                else:
-                    # 其他客户端错误，通常不需要重试
-                    print(f"    客户端错误 {response.status_code}")
-                    last_error = f'客户端错误: {response.status_code} - {response.text[:200]}'
-                    break
-            
-            except requests.exceptions.Timeout:
-                print(f"    网络超时 (第{attempt + 1}次尝试，180秒)")
-                last_error = '网络超时(180秒)'
-                if attempt < max_retries - 1:
-                    print(f"    等待15秒后进行第{attempt + 2}次尝试")
-                    time.sleep(15)
+                elif response.status_code == 429 and attempt < max_retries - 1:
+                    print(f"    频率限制，等待30秒后重试...")
+                    time.sleep(30)
                     continue
                     
-            except requests.exceptions.ConnectionError:
-                print(f"    网络连接失败 (第{attempt + 1}次尝试)")
-                last_error = '网络连接失败'
-                if attempt < max_retries - 1:
-                    print(f"    等待10秒后进行第{attempt + 2}次尝试")
+                elif response.status_code >= 500 and attempt < max_retries - 1:
+                    print(f"    服务器错误 {response.status_code}，等待10秒后重试...")
                     time.sleep(10)
                     continue
                     
-            except Exception as e:
-                print(f"    未知错误 (第{attempt + 1}次尝试): {str(e)}")
-                last_error = f'未知错误: {str(e)}'
+                elif response.status_code in [401, 403]:
+                    return {'success': False, 'error': f'认证错误: {response.status_code}', 'content': None}
+                    
+                else:
+                    return {'success': False, 'error': f'API错误: {response.status_code}', 'content': None}
+            
+            except (requests.exceptions.Timeout, requests.exceptions.ReadTimeout, 
+                   requests.exceptions.ConnectionError, TimeoutError, KeyboardInterrupt, 
+                   requests.exceptions.SSLError) as e:
+                if isinstance(e, KeyboardInterrupt):
+                    print(f"\n    用户中断操作")
+                    return {'success': False, 'error': '用户中断操作', 'content': None}
+                    
+                print(f"    网络超时/连接错误 (尝试 {attempt + 1}/{max_retries}): {type(e).__name__}")
                 if attempt < max_retries - 1:
-                    print(f"    等待5秒后进行第{attempt + 2}次尝试")
-                    time.sleep(5)
+                    wait_time = min(15 * (attempt + 1), 60)  # 递增等待时间，最大60秒
+                    print(f"    等待 {wait_time} 秒后重试...")
+                    time.sleep(wait_time)
                     continue
+                else:
+                    return {'success': False, 'error': f'网络超时，已重试{max_retries}次: {str(e)}', 'content': None}
+                    
+            except Exception as e:
+                print(f"    未知错误: {str(e)}")
+                return {'success': False, 'error': f'未知错误: {str(e)}', 'content': None}
         
-        # 所有重试都失败了
-        print(f"    API调用最终失败，已重试{max_retries}次")
-        return {
-            'success': False,
-            'error': last_error or 'API调用失败',
-            'content': None
-        }
+        print(f"    ✗ API调用最终失败，已重试{max_retries}次")
+        return {'success': False, 'error': 'API调用失败，已重试最大次数', 'content': None}
     
-    def analyze_citation_quality(self, row: pd.Series) -> Dict[str, Any]:
+    def analyze_single_row(self, row: pd.Series, rank: int = None) -> Dict[str, Any]:
         """分析单行数据的引用质量"""
         question = str(row['模型prompt'])
         answer = str(row['答案'])
@@ -411,44 +367,35 @@ class Method1BailianAnalyzer:
             if col_name in row and pd.notna(row[col_name]):
                 citations_dict[i] = str(row[col_name])
         
-        # 提取使用的引用
         citations_used = self.extract_citations(answer)
         
-        print(f"    问题长度: {len(question)}字符")
-        print(f"    答案长度: {len(answer)}字符")
-        print(f"    可用引文: {len(citations_dict)}个")
-        print(f"    实际引用: {citations_used}")
-        
-        # 如果没有任何引用，跳过分析
+        # 如果没有引用，跳过
         if not citations_used:
-            print("    跳过分析：答案中没有任何引用标记")
             return {
+                'rank': rank,
                 'question': question,
                 'answer_preview': answer[:200] + '...' if len(answer) > 200 else answer,
                 'citations_used': citations_used,
                 'citations_available': list(citations_dict.keys()),
-                'api_success': True,  # 标记为成功但跳过
+                'api_success': True,
                 'api_error': None,
                 'analysis': '跳过分析：答案中没有引用标记',
                 'skipped': True
             }
         
-        # 生成分析prompt
+        # 生成分析prompt并调用API
         analysis_prompt = self.prepare_analysis_prompt(question, answer, citations_dict)
-        
-        # 调用API分析
         api_result = self.call_api(analysis_prompt)
         
         analysis_content = None
         if api_result['success']:
             try:
-                # 尝试解析API返回的JSON字符串
                 analysis_content = json.loads(api_result['content'])
             except json.JSONDecodeError:
-                # 如果解析失败，说明返回的不是合法的JSON，作为原始文本处理
                 analysis_content = api_result['content']
 
-        result = {
+        return {
+            'rank': rank,
             'question': question,
             'answer_preview': answer[:200] + '...' if len(answer) > 200 else answer,
             'citations_used': citations_used,
@@ -458,10 +405,8 @@ class Method1BailianAnalyzer:
             'analysis': analysis_content,
             'skipped': False
         }
-        
-        return result
     
-    async def analyze_citation_quality_async(self, session: aiohttp.ClientSession, row: pd.Series, rank: int) -> Dict[str, Any]:
+    async def analyze_single_row_async(self, session: aiohttp.ClientSession, row: pd.Series, rank: int) -> Dict[str, Any]:
         """异步分析单行数据的引用质量"""
         question = str(row['模型prompt'])
         answer = str(row['答案'])
@@ -473,10 +418,9 @@ class Method1BailianAnalyzer:
             if col_name in row and pd.notna(row[col_name]):
                 citations_dict[i] = str(row[col_name])
         
-        # 提取使用的引用
         citations_used = self.extract_citations(answer)
         
-        # 如果没有任何引用，跳过分析
+        # 如果没有引用，跳过
         if not citations_used:
             return {
                 'rank': rank,
@@ -484,28 +428,24 @@ class Method1BailianAnalyzer:
                 'answer_preview': answer[:200] + '...' if len(answer) > 200 else answer,
                 'citations_used': citations_used,
                 'citations_available': list(citations_dict.keys()),
-                'api_success': True,  # 标记为成功但跳过
+                'api_success': True,
                 'api_error': None,
                 'analysis': '跳过分析：答案中没有引用标记',
                 'skipped': True
             }
         
-        # 生成分析prompt
+        # 生成分析prompt并调用异步API
         analysis_prompt = self.prepare_analysis_prompt(question, answer, citations_dict)
-        
-        # 调用异步API分析
         api_result = await self.call_api_async(session, analysis_prompt)
         
         analysis_content = None
         if api_result['success']:
             try:
-                # 尝试解析API返回的JSON字符串
                 analysis_content = json.loads(api_result['content'])
             except json.JSONDecodeError:
-                # 如果解析失败，说明返回的不是合法的JSON，作为原始文本处理
                 analysis_content = api_result['content']
 
-        result = {
+        return {
             'rank': rank,
             'question': question,
             'answer_preview': answer[:200] + '...' if len(answer) > 200 else answer,
@@ -516,8 +456,6 @@ class Method1BailianAnalyzer:
             'analysis': analysis_content,
             'skipped': False
         }
-        
-        return result
     
     async def batch_analyze_concurrent(self, csv_path: str, num_samples: int = None, specific_rank: int = None, start_from: int = None) -> List[Dict[str, Any]]:
         """异步并发批量分析"""
@@ -569,7 +507,7 @@ class Method1BailianAnalyzer:
         
         async def process_with_semaphore(session, row, rank):
             async with semaphore:
-                result = await self.analyze_citation_quality_async(session, row, rank + 1)
+                result = await self.analyze_single_row_async(session, row, rank + 1)
                 return result
         
         # 创建HTTP会话
@@ -669,7 +607,7 @@ class Method1BailianAnalyzer:
             actual_rank = idx + 1
             print(f"\n=== 正在分析第{actual_rank}条数据 (DataFrame索引: {idx}) ===")
             
-            result = self.analyze_citation_quality(row)
+            result = self.analyze_single_row(row, actual_rank)
             
             if result['api_success']:
                 print("    ✓ 分析成功")
@@ -689,7 +627,7 @@ class Method1BailianAnalyzer:
             else:
                 time.sleep(1)   # 失败后等1秒（原2秒），因为重试机制已经等待过了
         
-        print(f"\n=== 方案1百炼版分析完成 ===")
+        print(f"\n=== 引文分析完成 ====")
         print(f"成功: {success_count}条, 失败: {failed_count}条")
         
         return results
@@ -721,16 +659,15 @@ def get_user_choice() -> dict:
     """获取用户选择的运行模式"""
     print("\n=== 引文分析脚本 ===")
     print("请选择运行模式：")
-    print("1. 分析特定rank的单条数据（同步模式）")
-    print("2. 从指定位置开始分析指定数量的数据（同步模式）") 
+    print("1. 分析特定rank的单条数据")
+    print("2. 从指定位置开始分析指定数量的数据") 
     print("3. 分析所有数据（并发模式）")
     print("4. 分析前N条数据（并发模式）")
-    print("5. 分析特定rank的单条数据（并发模式）")
-    print("6. 退出")
+    print("5. 退出")
     
     while True:
         try:
-            choice = input("\n请输入选择 (1-6): ").strip()
+            choice = input("\n请输入选择 (1-5): ").strip()
             
             if choice == '1':
                 rank = int(input("请输入要分析的rank (从1开始): "))
@@ -750,10 +687,6 @@ def get_user_choice() -> dict:
                 return {"mode": "head", "num_samples": num_samples}
                 
             elif choice == '5':
-                rank = int(input("请输入要分析的rank (从1开始): "))
-                return {"mode": "specific_rank_async", "specific_rank": rank}
-                
-            elif choice == '6':
                 print("退出程序")
                 return {"mode": "exit"}
                 
@@ -766,173 +699,66 @@ def get_user_choice() -> dict:
             print("\n用户取消操作")
             return {"mode": "exit"}
 
-def main_unified():
-    """统一主函数，根据用户选择决定同步或异步"""
-    # 获取用户选择
-    user_choice = get_user_choice()
-    if user_choice["mode"] == "exit":
-        return
-        
-    # 根据模式决定使用同步还是异步
-    if user_choice["mode"] in ["specific_rank", "start_from"]:
-        # 同步模式
-        main_sync(user_choice)
-    else:
-        # 异步模式
-        asyncio.run(main_async_impl(user_choice))
 
-def main_sync(user_choice):
-    """同步版本主函数"""
-    analyzer = Method1BailianAnalyzer()
-    
-    # 数据路径
-    csv_path = "local_data/副本正文引文内容（纯净版）.csv"
-    
-    # 根据用户选择设置输出文件名
-    if user_choice["mode"] == "specific_rank":
-        output_path = f"local_data/citation_analysis_rank_{user_choice['specific_rank']}_sync_results.json"
-    elif user_choice["mode"] == "start_from":
-        if user_choice.get("num_samples"):
-            output_path = f"local_data/citation_analysis_from_{user_choice['start_from']}_count_{user_choice['num_samples']}_sync_results.json"
-        else:
-            output_path = f"local_data/citation_analysis_from_{user_choice['start_from']}_to_end_sync_results.json"
-    else:
-        output_path = "local_data/citation_analysis_sync_results.json"
 
-    print(f"开始同步分析...")
-    print(f"输出文件：{output_path}")
-    
-    # 根据用户选择调用不同的分析方法
-    if user_choice["mode"] == "specific_rank":
-        results = analyzer.batch_analyze(csv_path, specific_rank=user_choice["specific_rank"])
-    elif user_choice["mode"] == "start_from":
-        results = analyzer.batch_analyze(csv_path, 
-                                       num_samples=user_choice.get("num_samples"),
-                                       start_from=user_choice["start_from"])
-    else:
-        results = analyzer.batch_analyze(csv_path)
-    
-    if results:
-        analyzer.save_results(results, output_path)
-        print(f"\n方案1百炼版分析完成！")
-        
-        # 显示成功的结果预览
-        success_results = [r for r in results if r['api_success']]
-        if success_results:
-            print(f"\n成功分析示例：")
-            for i, result in enumerate(success_results[:1]):
-                print(f"\n{i+1}. 第{result['rank']}条数据:")
-                print(f"   使用引用: {result['citations_used']}")
-                print(f"   可用引文: {len(result['citations_available'])}个")
-                if result['analysis']:
-                    print(f"   分析片段: {result['analysis'][:150]}...")
-    else:
-        print("分析失败，请检查数据文件和AL_KEY配置")
-
-async def main_async_impl(user_choice):
-    """异步并发版本的主函数实现"""
-    analyzer = Method1BailianAnalyzer(concurrent_limit=50)  # 50并发
-    
-    # 数据路径
-    csv_path = "local_data/副本正文引文内容（纯净版）.csv"
-    
-    # 根据用户选择设置输出文件名
-    if user_choice["mode"] == "specific_rank_async":
-        output_path = f"local_data/citation_analysis_rank_{user_choice['specific_rank']}_async_results.json"
-    elif user_choice["mode"] == "head":
-        output_path = f"local_data/citation_analysis_head_{user_choice['num_samples']}_results.json"
-    else:
-        output_path = "local_data/citation_analysis_method1_bailian_concurrent_results.json"
-
-    print(f"🚀 启动高速并发分析模式！")
-    print(f"输出文件：{output_path}")
-    
-    # 根据用户选择调用不同的分析方法
-    if user_choice["mode"] == "specific_rank_async":
-        results = await analyzer.batch_analyze_concurrent(csv_path, specific_rank=user_choice["specific_rank"])
-    elif user_choice["mode"] == "head":
-        results = await analyzer.batch_analyze_concurrent(csv_path, num_samples=user_choice["num_samples"])
-    else:  # "all"
-        results = await analyzer.batch_analyze_concurrent(csv_path, num_samples=None)
-    
-    if results:
-        analyzer.save_results(results, output_path)
-        print(f"\n🎉 并发分析完成！")
-        
-        # 显示成功的结果预览
-        success_results = [r for r in results if r['api_success']]
-        if success_results:
-            print(f"\n成功分析示例：")
-            for i, result in enumerate(success_results[:1]):
-                print(f"\n{i+1}. 第{result['rank']}条数据:")
-                print(f"   使用引用: {result['citations_used']}")
-                print(f"   可用引文: {len(result['citations_available'])}个")
-                if result['analysis']:
-                    print(f"   分析片段: {result['analysis'][:150]}...")
-    else:
-        print("分析失败，请检查数据文件和AL_KEY配置")
-
-# 保留原来的函数名作为别名        
-async def main_async():
-    """异步并发版本的主函数（兼容性保留）"""
-    user_choice = {"mode": "all"}
-    await main_async_impl(user_choice)
 
 def main():
-    """交互式主函数"""
-    # 获取用户选择
+    """主函数：根据用户选择决定同步或异步模式"""
     user_choice = get_user_choice()
     if user_choice["mode"] == "exit":
         return
-        
-    analyzer = Method1BailianAnalyzer()
     
-    # 数据路径
+    # 只有单条数据分析使用同步，其他都用异步并发
+    if user_choice["mode"] == "specific_rank":
+        _run_sync_analysis(user_choice)
+    else:
+        asyncio.run(_run_async_analysis(user_choice))
+
+def _run_sync_analysis(user_choice):
+    """运行同步分析（仅用于单条数据）"""
+    analyzer = Method1BailianAnalyzer()
     csv_path = "local_data/副本正文引文内容（纯净版）.csv"
     
-    # 根据用户选择设置输出文件名
-    if user_choice["mode"] == "specific_rank":
-        output_path = f"local_data/citation_analysis_rank_{user_choice['specific_rank']}_sync_results.json"
-    elif user_choice["mode"] == "start_from":
-        if user_choice.get("num_samples"):
-            output_path = f"local_data/citation_analysis_from_{user_choice['start_from']}_count_{user_choice['num_samples']}_sync_results.json"
-        else:
-            output_path = f"local_data/citation_analysis_from_{user_choice['start_from']}_to_end_sync_results.json"
-    elif user_choice["mode"] == "head":
-        output_path = f"local_data/citation_analysis_head_{user_choice['num_samples']}_sync_results.json"
-    else:
-        output_path = "local_data/citation_analysis_method1_bailian_sync_results.json"
+    output_path = f"local_data/citation_analysis_rank_{user_choice['specific_rank']}_results.json"
+    results = analyzer.batch_analyze(csv_path, specific_rank=user_choice["specific_rank"])
+    
+    _save_and_display_results(analyzer, results, output_path)
 
-    print(f"开始同步分析...")
-    print(f"输出文件：{output_path}")
+async def _run_async_analysis(user_choice):
+    """运行异步并发分析"""
+    analyzer = Method1BailianAnalyzer(concurrent_limit=50)
+    csv_path = "local_data/副本正文引文内容（纯净版）.csv"
     
-    # 根据用户选择调用不同的分析方法
-    if user_choice["mode"] == "specific_rank":
-        results = analyzer.batch_analyze(csv_path, specific_rank=user_choice["specific_rank"])
-    elif user_choice["mode"] == "start_from":
-        results = analyzer.batch_analyze(csv_path, 
-                                       num_samples=user_choice.get("num_samples"),
-                                       start_from=user_choice["start_from"])
-    else:  # "all" or "head"
-        results = analyzer.batch_analyze(csv_path, num_samples=user_choice.get("num_samples"))
+    if user_choice["mode"] == "start_from":
+        start = user_choice['start_from']
+        count = user_choice.get('num_samples')
+        if count:
+            output_path = f"local_data/citation_analysis_from_{start}_count_{count}_results.json"
+        else:
+            output_path = f"local_data/citation_analysis_from_{start}_to_end_results.json"
+        results = await analyzer.batch_analyze_concurrent(csv_path, num_samples=count, start_from=start)
+    elif user_choice["mode"] == "head":
+        output_path = f"local_data/citation_analysis_head_{user_choice['num_samples']}_results.json"
+        results = await analyzer.batch_analyze_concurrent(csv_path, num_samples=user_choice["num_samples"])
+    else:  # "all"
+        output_path = "local_data/citation_analysis_method1_bailian_results.json"
+        results = await analyzer.batch_analyze_concurrent(csv_path, num_samples=None)
     
+    _save_and_display_results(analyzer, results, output_path)
+
+def _save_and_display_results(analyzer, results, output_path):
+    """保存和显示结果"""
     if results:
         analyzer.save_results(results, output_path)
-        print(f"\n方案1百炼版分析完成！")
+        print(f"\n引文分析完成！")
         
-        # 显示成功的结果预览
         success_results = [r for r in results if r['api_success']]
         if success_results:
-            print(f"\n成功分析示例：")
-            for i, result in enumerate(success_results[:1]):
-                print(f"\n{i+1}. 第{result['rank']}条数据:")
-                print(f"   使用引用: {result['citations_used']}")
-                print(f"   可用引文: {len(result['citations_available'])}个")
-                if result['analysis']:
-                    print(f"   分析片段: {result['analysis'][:150]}...")
+            print(f"\n成功分析 {len(success_results)} 条，示例：")
+            result = success_results[0]
+            print(f"  第{result['rank']}条: 引用{result['citations_used']}, 可用{len(result['citations_available'])}个引文")
     else:
         print("分析失败，请检查数据文件和AL_KEY配置")
 
 if __name__ == "__main__":
-    # 运行统一主函数，根据用户选择自动决定同步或异步
-    main_unified()
+    main()
